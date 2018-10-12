@@ -93,6 +93,8 @@ class RepeatCopyTaskParams(object):
 @attrs
 class RepeatCopyTaskModelTraining(object):
     params = attrib(default=Factory(RepeatCopyTaskParams))
+    cuda = attrib(default=False)
+    time = attrib(default=False)
     net = attrib()
     dataloader = attrib()
     criterion = attrib()
@@ -104,7 +106,11 @@ class RepeatCopyTaskModelTraining(object):
         net = EncapsulatedNTM(self.params.sequence_width + 2, self.params.sequence_width + 1,
                               self.params.controller_size, self.params.controller_layers,
                               self.params.num_heads,
-                              self.params.memory_n, self.params.memory_m)
+                              self.params.memory_n, self.params.memory_m,
+                              self.cuda,
+                              self.time)
+        if self.cuda and torch.cuda.is_available():
+          net.cuda()
         return net
 
     @dataloader.default
@@ -116,10 +122,14 @@ class RepeatCopyTaskModelTraining(object):
 
     @criterion.default
     def default_criterion(self):
-        return nn.BCELoss()
+        criterion = nn.BCELoss()
+        if self.cuda and torch.cuda.is_available():
+          criterion = criterion.cuda()
+        return criterion
 
     @optimizer.default
     def default_optimizer(self):
+        #TODO: GPUize optimizer?
         return optim.RMSprop(self.net.parameters(),
                              momentum=self.params.rmsprop_momentum,
                              alpha=self.params.rmsprop_alpha,

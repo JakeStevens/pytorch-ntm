@@ -13,6 +13,7 @@ import sys
 import attr
 import argcomplete
 import torch
+from torch.nn.parallel import data_parallel
 import numpy as np
 
 
@@ -47,6 +48,8 @@ def init_seed(seed=None):
     LOGGER.info("Using seed=%d", seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
+    if torch.cuda.is_available():
+      torch.cuda.manual_seed(seed)
     random.seed(seed)
 
 
@@ -89,23 +92,31 @@ def clip_grads(net):
         p.grad.data.clamp_(-10, 10)
 
 
-def train_batch(net, criterion, optimizer, X, Y):
+def train_batch(net, criterion, optimizer, X, Y, use_cuda):
     """Trains a single batch."""
     optimizer.zero_grad()
     inp_seq_len = X.size(0)
     outp_seq_len, batch_size, _ = Y.size()
 
     # New sequence
-    net.init_sequence(batch_size)
+    net.init_sequence(batch_size, use_cuda)
 
     # Feed the sequence + delimiter
     for i in range(inp_seq_len):
-        net(X[i])
+        if use_cuda and torch.cuda.is_available():
+            net(X[i])#data_parallel(net, X[i])
+        else:
+            net(X[i])
 
     # Read the output (no input given)
-    y_out = torch.zeros(Y.size())
+    y_out = []
     for i in range(outp_seq_len):
-        y_out[i], _ = net()
+        if use_cuda and torch.cuda.is_available():
+            o, _ = data_parallel(net, X[i])
+        else:
+            o, _ = net(X[i])
+        y_out += [o]
+    y_out = torch.cat(y_out, dim=0).unsqueeze(1)
 
     loss = criterion(y_out, Y)
     loss.backward()
@@ -113,7 +124,10 @@ def train_batch(net, criterion, optimizer, X, Y):
     optimizer.step()
 
     y_out_binarized = y_out.clone().data
-    y_out_binarized.apply_(lambda x: 0 if x < 0.5 else 1)
+    for i in y_out_binarized:
+        for j in i:
+            for k in j:
+                k = 0 if k < 0.5 else 1
 
     # The cost is the number of error bits per sequence
     cost = torch.sum(torch.abs(y_out_binarized - Y.data))
@@ -123,6 +137,7 @@ def train_batch(net, criterion, optimizer, X, Y):
 
 def evaluate(net, criterion, X, Y):
     """Evaluate a single batch (without training)."""
+    #TODO: GPUize?
     inp_seq_len = X.size(0)
     outp_seq_len, batch_size, _ = Y.size()
 
@@ -150,7 +165,7 @@ def evaluate(net, criterion, X, Y):
     cost = torch.sum(torch.abs(y_out_binarized - Y.data))
 
     result = {
-        'loss': loss.data[0],
+        'loss': loss.data.item(),
         'cost': cost / batch_size,
         'y_out': y_out,
         'y_out_binarized': y_out_binarized,
@@ -173,7 +188,13 @@ def train_model(model, args):
     start_ms = get_ms()
 
     for batch_num, x, y in model.dataloader:
-        loss, cost = train_batch(model.net, model.criterion, model.optimizer, x, y)
+        if args.use_cuda and torch.cuda.is_available():
+            use_cuda = True
+            x = x.cuda()
+            y = y.cuda()
+        else:
+            use_cuda = False
+        loss, cost = train_batch(model.net, model.criterion, model.optimizer, x, y, use_cuda)
         losses += [loss]
         costs += [cost]
         seq_lengths += [y.size(0)]
@@ -213,6 +234,8 @@ def init_arguments():
                         help="Path for saving checkpoint data (default: './')")
     parser.add_argument('--report-interval', type=int, default=REPORT_INTERVAL,
                         help="Reporting interval")
+    parser.add_argument('--gpu', dest='use_cuda', default=False, action='store_true', help='Use the GPU')
+    parser.add_argument('--time', dest='time', default=False, action='store_true', help='Time the execution')
 
     argcomplete.autocomplete(parser)
 
@@ -252,8 +275,7 @@ def init_model(args):
     params = update_model_params(params, args.param)
 
     LOGGER.info(params)
-
-    model = model_cls(params=params)
+    model = model_cls(params=params, cuda=args.use_cuda, time=args.time)
     return model
 
 
@@ -267,7 +289,6 @@ def main():
 
     # Initialize arguments
     args = init_arguments()
-
     # Initialize random
     init_seed(args.seed)
 

@@ -3,10 +3,11 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
+import time
 
 class NTM(nn.Module):
     """A Neural Turing Machine."""
-    def __init__(self, num_inputs, num_outputs, controller, memory, heads):
+    def __init__(self, num_inputs, num_outputs, controller, memory, heads, time=False):
         """Initialize the NTM.
 
         :param num_inputs: External input size.
@@ -27,6 +28,7 @@ class NTM(nn.Module):
         self.controller = controller
         self.memory = memory
         self.heads = heads
+        self.time = time
 
         self.N, self.M = memory.size()
         _, self.controller_size = controller.size()
@@ -48,10 +50,20 @@ class NTM(nn.Module):
         self.fc = nn.Linear(self.controller_size + self.num_read_heads * self.M, num_outputs)
         self.reset_parameters()
 
-    def create_new_state(self, batch_size):
+        self.controller_time = 0
+        self.memory_time = 0
+
+    def __del__(self):
+        if self.time:
+            print("\nController Time: " + str(self.controller_time))
+            print("Memory Time: " + str(self.memory_time))
+
+    def create_new_state(self, batch_size, use_cuda=False):
         init_r = [r.clone().repeat(batch_size, 1) for r in self.init_r]
+        if use_cuda and torch.cuda.is_available():
+          init_r = [r.cuda() for r in self.init_r]
         controller_state = self.controller.create_new_state(batch_size)
-        heads_state = [head.create_new_state(batch_size) for head in self.heads]
+        heads_state = [head.create_new_state(batch_size, use_cuda) for head in self.heads]
 
         return init_r, controller_state, heads_state
 
@@ -70,19 +82,40 @@ class NTM(nn.Module):
         prev_reads, prev_controller_state, prev_heads_states = prev_state
 
         # Use the controller to get an embeddings
-        inp = torch.cat([x] + prev_reads, dim=1)
-        controller_outp, controller_state = self.controller(inp, prev_controller_state)
+        if self.time:
+            start = time.time()
+            inp = torch.cat([x] + prev_reads, dim=1)
+            controller_outp, controller_state = self.controller(inp, prev_controller_state)
+            torch.cuda.synchronize()
+            end = time.time()
+            self.controller_time += (end-start)
+        else:
+            inp = torch.cat([x] + prev_reads, dim=1)
+            controller_outp, controller_state = self.controller(inp, prev_controller_state)
 
         # Read/Write from the list of heads
         reads = []
         heads_states = []
-        for head, prev_head_state in zip(self.heads, prev_heads_states):
-            if head.is_read_head():
-                r, head_state = head(controller_outp, prev_head_state)
-                reads += [r]
-            else:
-                head_state = head(controller_outp, prev_head_state)
-            heads_states += [head_state]
+        if self.time:
+            start = time.time()
+            for head, prev_head_state in zip(self.heads, prev_heads_states):
+                if head.is_read_head():
+                    r, head_state = head(controller_outp, prev_head_state)
+                    reads += [r]
+                else:
+                    head_state = head(controller_outp, prev_head_state)
+                heads_states += [head_state]
+            torch.cuda.synchronize()
+            end = time.time()
+            self.memory_time += (end-start)
+        else:
+            for head, prev_head_state in zip(self.heads, prev_heads_states):
+                if head.is_read_head():
+                    r, head_state = head(controller_outp, prev_head_state)
+                    reads += [r]
+                else:
+                    head_state = head(controller_outp, prev_head_state)
+                heads_states += [head_state]
 
         # Generate Output
         inp2 = torch.cat([controller_outp] + reads, dim=1)
