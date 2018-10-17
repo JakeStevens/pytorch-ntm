@@ -112,9 +112,9 @@ def train_batch(net, criterion, optimizer, X, Y, use_cuda):
     y_out = []
     for i in range(outp_seq_len):
         if use_cuda and torch.cuda.is_available():
-            o, _ = data_parallel(net, X[i])
+            o, _ = net()#data_parallel(net)?
         else:
-            o, _ = net(X[i])
+            o, _ = net()
         y_out += [o]
     y_out = torch.cat(y_out, dim=0).unsqueeze(1)
 
